@@ -22,7 +22,7 @@ func TestRegisterDeclaresPluginContract(t *testing.T) {
 	if registered.Metadata.Author != "5345asda" || registered.Metadata.GitHubRepository != "https://github.com/5345asda/codex-turn-state-cache" {
 		t.Fatalf("metadata = %#v", registered.Metadata)
 	}
-	if !registered.Capabilities.RequestInterceptor || !registered.Capabilities.RequestLifecyclePlugin || !registered.Capabilities.ResponseInterceptor || !registered.Capabilities.StreamChunkInterceptor {
+	if !registered.Capabilities.RequestInterceptor || !registered.Capabilities.RequestLifecyclePlugin || !registered.Capabilities.ResponseInterceptor || !registered.Capabilities.StreamChunkInterceptor || !registered.Capabilities.WebSocketResponseObserver {
 		t.Fatalf("capabilities = %#v", registered.Capabilities)
 	}
 }
@@ -58,6 +58,47 @@ func afterAuthRequest(requestID, authID, model string) pluginapi.RequestIntercep
 		ToFormat:  "codex",
 		Model:     model,
 		Metadata:  map[string]any{"selected_auth_id": authID},
+	}
+}
+
+func TestAcceptsTeamState332(t *testing.T) {
+	configureTestPlugin(t)
+	teamState := strings.Repeat("t", turnstate.StateLengthTeam)
+	callPluginMethod(t, pluginabi.MethodRequestInterceptAfter, afterAuthRequest("capture-team", "auth-team", "gpt-6-astra"), &pluginapi.RequestInterceptResponse{})
+	callPluginMethod(t, pluginabi.MethodResponseInterceptAfter, pluginapi.ResponseInterceptRequest{
+		RequestID:       "capture-team",
+		ResponseHeaders: http.Header{turnstate.TurnStateHeader: {teamState}},
+	}, &pluginapi.ResponseInterceptResponse{})
+
+	var hit pluginapi.RequestInterceptResponse
+	callPluginMethod(t, pluginabi.MethodRequestInterceptAfter, afterAuthRequest("reuse-team", "auth-team", "gpt-6-astra"), &hit)
+	if got := hit.Headers.Get(turnstate.TurnStateHeader); got != teamState {
+		t.Fatalf("expected team state %q, got %q", teamState, got)
+	}
+}
+
+func TestWebSocketResponseObserverRPC(t *testing.T) {
+	configureTestPlugin(t)
+	teamState := strings.Repeat("w", turnstate.StateLengthTeam)
+
+	// Step 1: Bind after-auth
+	callPluginMethod(t, pluginabi.MethodRequestInterceptAfter, afterAuthRequest("ws-rpc-1", "auth-ws", "gpt-6-astra"), &pluginapi.RequestInterceptResponse{})
+
+	// Step 2: Observe WebSocket event via RPC
+	metadataPayload := []byte(`{"type":"codex.response.metadata","headers":{"x-codex-turn-state":"` + teamState + `","x-codex-plan-type":"team"}}`)
+	callPluginMethod(t, pluginabi.MethodWebSocketResponseEvent, webSocketResponseEventRPC{
+		WebSocketResponseEvent: pluginapi.WebSocketResponseEvent{
+			RequestID: "ws-rpc-1",
+			EventType: "codex.response.metadata",
+			Payload:   metadataPayload,
+		},
+	}, &struct{}{})
+
+	// Step 3: Verify injection in next turn
+	var hit pluginapi.RequestInterceptResponse
+	callPluginMethod(t, pluginabi.MethodRequestInterceptAfter, afterAuthRequest("ws-rpc-2", "auth-ws", "gpt-6-astra"), &hit)
+	if got := hit.Headers.Get(turnstate.TurnStateHeader); got != teamState {
+		t.Fatalf("expected injected state %q, got %q", teamState, got)
 	}
 }
 

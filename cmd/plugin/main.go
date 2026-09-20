@@ -76,7 +76,7 @@ const (
 	defaultMaxEntries        = 10_000
 	defaultMaxPendingEntries = 20_000
 	pluginID                 = "codex-turn-state-cache"
-	pluginVersion            = "0.1.2"
+	pluginVersion            = "0.3.0"
 )
 
 var runtime = pluginRuntime{
@@ -92,8 +92,9 @@ type pluginRuntime struct {
 }
 
 type pluginConfig struct {
-	MaxEntries        int `yaml:"max_entries"`
-	MaxPendingEntries int `yaml:"max_pending_entries"`
+	MaxEntries        int   `yaml:"max_entries"`
+	MaxPendingEntries int   `yaml:"max_pending_entries"`
+	AcceptedLengths   []int `yaml:"accepted_lengths"`
 }
 
 type lifecycleRequest struct {
@@ -116,6 +117,11 @@ type streamChunkInterceptRPC struct {
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
+type webSocketResponseEventRPC struct {
+	pluginapi.WebSocketResponseEvent
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
 type hostLogRequest struct {
 	HostCallbackID string        `json:"host_callback_id,omitempty"`
 	Level          string        `json:"level,omitempty"`
@@ -135,10 +141,11 @@ type registration struct {
 }
 
 type registrationCapabilities struct {
-	RequestInterceptor     bool `json:"request_interceptor"`
-	RequestLifecyclePlugin bool `json:"request_lifecycle_plugin"`
-	ResponseInterceptor    bool `json:"response_interceptor"`
-	StreamChunkInterceptor bool `json:"response_stream_interceptor"`
+	RequestInterceptor        bool `json:"request_interceptor"`
+	RequestLifecyclePlugin    bool `json:"request_lifecycle_plugin"`
+	ResponseInterceptor       bool `json:"response_interceptor"`
+	StreamChunkInterceptor    bool `json:"response_stream_interceptor"`
+	WebSocketResponseObserver bool `json:"websocket_response_observer"`
 }
 
 func main() {}
@@ -212,6 +219,8 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 		return interceptResponse(raw)
 	case pluginabi.MethodResponseInterceptStreamChunk:
 		return interceptStreamChunk(raw)
+	case pluginabi.MethodWebSocketResponseEvent:
+		return observeWebSocketResponseEvent(raw)
 	case pluginabi.MethodRequestComplete:
 		return completeRequest(raw)
 	default:
@@ -249,7 +258,7 @@ func configure(raw []byte) error {
 
 func newPlugin(cfg pluginConfig) *turnstate.Plugin {
 	return turnstate.NewPlugin(
-		turnstate.NewCache(cfg.MaxEntries, cfg.MaxPendingEntries, nil),
+		turnstate.NewCache(cfg.MaxEntries, cfg.MaxPendingEntries, nil, cfg.AcceptedLengths...),
 		logTurnState,
 	)
 }
@@ -288,13 +297,19 @@ func pluginRegistration() registration {
 					Type:        pluginapi.ConfigFieldTypeInteger,
 					Description: "Maximum in-flight request correlations.",
 				},
+				{
+					Name:        "accepted_lengths",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "Accepted raw byte lengths of turn-state (default: [292, 332]).",
+				},
 			},
 		},
 		Capabilities: registrationCapabilities{
-			RequestInterceptor:     true,
-			RequestLifecyclePlugin: true,
-			ResponseInterceptor:    true,
-			StreamChunkInterceptor: true,
+			RequestInterceptor:        true,
+			RequestLifecyclePlugin:    true,
+			ResponseInterceptor:       true,
+			StreamChunkInterceptor:    true,
+			WebSocketResponseObserver: true,
 		},
 	}
 }
@@ -345,6 +360,17 @@ func interceptStreamChunk(raw []byte) ([]byte, error) {
 		return nil, errIntercept
 	}
 	return okEnvelope(response)
+}
+
+func observeWebSocketResponseEvent(raw []byte) ([]byte, error) {
+	var request webSocketResponseEventRPC
+	if errUnmarshal := json.Unmarshal(raw, &request); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	if errObserve := currentPlugin().ObserveWebSocketResponseEvent(contextWithHostCallbackID(request.HostCallbackID), request.WebSocketResponseEvent); errObserve != nil {
+		return nil, errObserve
+	}
+	return okEnvelope(struct{}{})
 }
 
 func completeRequest(raw []byte) ([]byte, error) {
