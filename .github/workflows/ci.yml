@@ -114,10 +114,10 @@ jobs:
         include:
           - arch: arm64
             goarch: arm64
-            target: arm64-apple-macos11
+            target: arm64-apple-macos13
           - arch: amd64
             goarch: amd64
-            target: x86_64-apple-macos10.15
+            target: x86_64-apple-macos13
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
