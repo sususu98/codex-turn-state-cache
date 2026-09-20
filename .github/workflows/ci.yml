@@ -17,7 +17,7 @@ permissions:
 jobs:
   test:
     name: Test & Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,7 +36,7 @@ jobs:
 
   build-linux:
     name: Build Linux (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: test
     strategy:
       fail-fast: false
@@ -106,7 +106,7 @@ jobs:
 
   build-darwin:
     name: Build macOS (${{ matrix.arch }})
-    runs-on: macos-latest
+    runs-on: macos-14
     needs: test
     strategy:
       fail-fast: false
@@ -168,7 +168,7 @@ jobs:
 
   release:
     name: Release Assets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build-linux, build-darwin]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
