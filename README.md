@@ -35,6 +35,11 @@ codex turn-state cache injected
 
 ## CPA Configuration
 
+See [config.example.yaml](config.example.yaml) for a copyable configuration
+fragment with Chinese comments, inline proxies and optional email/AuthID filters.
+Merge it into your existing CPA YAML; do not replace the entire configuration.
+Prewarming is disabled in the example until you supply real settings.
+
 Install from the CPA plugin store, or place the Linux/amd64 library at:
 
 ```text

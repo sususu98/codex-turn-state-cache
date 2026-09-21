@@ -1,0 +1,51 @@
+# Codex Turn-State Cache 配置示例（v0.5.0+）
+# 这是 CPA 配置片段，不是完整的 CPA 配置。
+# 合并到现有 config.yaml 中；已有 plugins/configs 时请合并，不要重复键或覆盖其他插件。
+# 插件不改变正式请求的代理出口，只注入已验证的 X-Codex-Turn-State。
+
+plugins:
+  enabled: true
+  # 改为实际插件目录，里面应有本插件的 .so（Linux）或 .dylib（macOS）。
+  # Local CPA 示例：/Users/你的用户名/.config/cpa/plugins
+  dir: /absolute/path/to/cpa/plugins
+  configs:
+    codex-turn-state-cache:
+      enabled: true
+      priority: 10
+      prewarm:
+        # 先填好模型、代理和账号筛选，再改成 true。
+        # false 只关闭后台预热，不关闭插件原有的被动 state 缓存。
+        enabled: false
+
+        # 填 CPA 选定的上游模型名，不是客户端自定义别名；可配置多个。
+        models:
+          - gpt-6-astra
+
+        # 所有参与账号/模型共享的滚动一小时探测请求上限。
+        # 采集与正式出口复验都计数（包括失败），会产生真实上游用量。
+        # 可配置范围 2～1000；此处示例为 384，省略时默认 12。
+        max_probes_per_hour: 384
+
+        # 仅供后台采集使用；域名由 SOCKS5H 代理解析。
+        # 使用你自己的代理替换占位值，勿将真实用户名/密码提交到 Git。
+        # 用户名/密码里的特殊字符需要 URL 编码，例如 @ → %40、# → %23。
+        proxies:
+          - "socks5h://USERNAME:PASSWORD@proxy1.example:1080"
+          - "socks5h://USERNAME:PASSWORD@proxy2.example:1080"
+
+        # 可选：只预热匹配的账号，下面两种写法可以混用，命中任一条即可。
+        # 邮箱精确匹配但忽略大小写；同邮箱有多个账号时匹配其中符合条件的账号。
+        # auth_id 必须是 CPA 的实际 AuthID，不是 auth_index。
+        # 每条只写 email 或 auth_id，不需要再写套餐和模型。
+        # 想预热全部符合条件的启用账号：删除整个 accounts 块。
+        # 禁用、套餐未知或不支持的账号始终跳过，插件不会自动启用账号。
+        accounts:
+          - email: someone@example.com
+          - auth_id: codex-example.json
+
+        # 并发、重试、超时、冷却和 TTL 使用内置默认值，通常无需配置。
+        # 普通文件模式会自动定位 Host 的 -config 路径，不需要 host_config_file。
+        # 代理直接放上面的列表，不需要 proxy_file 或额外 TXT 文件。
+
+# 迁移真实代理后，请保护配置及备份权限（例如 chmod 600 config.yaml）。
+# 有权读取 CPA 管理配置/YAML 的人也能看到这里的代理密码。

@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/5345asda/codex-turn-state-cache/internal/prewarm"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"gopkg.in/yaml.v3"
 )
 
 func TestMinimalPluginConfigurationWithEmailSelector(t *testing.T) {
@@ -61,6 +63,44 @@ func TestInvalidInlineYAMLDoesNotLeakProxyCredentials(t *testing.T) {
 		t.Fatal("failed YAML reload replaced instance")
 	}
 }
+func TestExampleConfiguration(t *testing.T) {
+	raw, err := os.ReadFile("../../config.example.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Plugins struct {
+			Configs map[string]pluginConfig `yaml:"configs"`
+		} `yaml:"plugins"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	cfg, ok := doc.Plugins.Configs[pluginID]
+	if !ok {
+		t.Fatal("example does not contain plugin configuration")
+	}
+	if cfg.Prewarm.Enabled {
+		t.Fatal("example must not start paid probes by default")
+	}
+	cfg.Prewarm.Enabled = true
+	cfg.Prewarm.Defaults()
+	if err := cfg.Prewarm.Validate(); err != nil {
+		t.Fatal("enabled example is invalid", err)
+	}
+	proxies, err := cfg.Prewarm.LoadProxies()
+	if err != nil || len(proxies) != 2 {
+		t.Fatal("example proxies invalid", err)
+	}
+	if len(cfg.Prewarm.Accounts) != 2 || cfg.Prewarm.Accounts[0].Email == "" || cfg.Prewarm.Accounts[1].AuthID == "" {
+		t.Fatal("example must demonstrate both selectors")
+	}
+	cfg.Prewarm.Accounts = nil
+	if err := cfg.Prewarm.Validate(); err != nil {
+		t.Fatal("all-account example is invalid", err)
+	}
+}
+
 func TestLiveEnvironmentReader(t *testing.T) {
 	const key = "TURN_STATE_TEST_LIVE_ENV"
 	t.Setenv(key, "initial")
