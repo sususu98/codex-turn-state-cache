@@ -64,8 +64,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 	"unsafe"
 
+	"github.com/5345asda/codex-turn-state-cache/internal/prewarm"
 	"github.com/5345asda/codex-turn-state-cache/internal/turnstate"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -76,7 +78,7 @@ const (
 	defaultMaxEntries        = 10_000
 	defaultMaxPendingEntries = 20_000
 	pluginID                 = "codex-turn-state-cache"
-	pluginVersion            = "0.3.0"
+	pluginVersion            = "0.5.0"
 )
 
 var runtime = pluginRuntime{
@@ -86,15 +88,24 @@ var runtime = pluginRuntime{
 	}),
 }
 
+var lifecycleMu sync.Mutex
+
+// Terminal until native init; protected by lifecycleMu.
+var runtimeStopped bool
+var sharedProbeBudget prewarm.Budget
+var hostCallbackGate sync.RWMutex
+var hostCallbacksOpen bool
+
 type pluginRuntime struct {
 	mu     sync.RWMutex
 	plugin *turnstate.Plugin
 }
 
 type pluginConfig struct {
-	MaxEntries        int   `yaml:"max_entries"`
-	MaxPendingEntries int   `yaml:"max_pending_entries"`
-	AcceptedLengths   []int `yaml:"accepted_lengths"`
+	MaxEntries        int            `yaml:"max_entries"`
+	MaxPendingEntries int            `yaml:"max_pending_entries"`
+	AcceptedLengths   []int          `yaml:"accepted_lengths"`
+	Prewarm           prewarm.Config `yaml:"prewarm"`
 }
 
 type lifecycleRequest struct {
@@ -155,7 +166,13 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	if plugin == nil {
 		return 1
 	}
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	runtimeStopped = false
+	hostCallbackGate.Lock()
 	C.store_host_api(host)
+	hostCallbacksOpen = host != nil
+	hostCallbackGate.Unlock()
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -197,8 +214,16 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
-	resetRuntime()
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	runtimeStopped = true
+	resetRuntimeLocked()
+	// Drain foreground/log callbacks too, not just background workers. Waiting
+	// writers prevent new readers from entering before the closed flag is set.
+	hostCallbackGate.Lock()
+	hostCallbacksOpen = false
 	C.clear_host_api()
+	hostCallbackGate.Unlock()
 }
 
 func handleMethod(method string, raw []byte) ([]byte, error) {
@@ -229,6 +254,11 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 }
 
 func configure(raw []byte) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	if runtimeStopped {
+		return fmt.Errorf("plugin runtime is shut down")
+	}
 	var request lifecycleRequest
 	if errUnmarshal := json.Unmarshal(raw, &request); errUnmarshal != nil {
 		return errUnmarshal
@@ -243,16 +273,38 @@ func configure(raw []byte) error {
 	}
 	if len(request.ConfigYAML) > 0 {
 		if errUnmarshal := yaml.Unmarshal(request.ConfigYAML, &cfg); errUnmarshal != nil {
-			return errUnmarshal
+			// Inline proxy credentials must not be echoed by YAML type errors.
+			return fmt.Errorf("invalid plugin configuration")
 		}
 	}
 	if cfg.MaxEntries < 1 || cfg.MaxPendingEntries < 1 {
 		return fmt.Errorf("max_entries and max_pending_entries must be greater than zero")
 	}
 
+	next := newPlugin(cfg)
+	if cfg.Prewarm.Enabled {
+		cfg.Prewarm.Defaults()
+		if err := cfg.Prewarm.Validate(); err != nil {
+			return err
+		}
+		client, err := newProbeClient(cfg.Prewarm.HostConfigFile)
+		if err != nil {
+			return err
+		}
+		warmer, err := prewarm.New(cfg.Prewarm, client, func(message, model string) { logTurnState(context.Background(), message, model) })
+		if err != nil {
+			return err
+		}
+		warmer.SetBudget(&sharedProbeBudget)
+		warmer.DelayStart(5 * time.Second)
+		next.SetPrewarm(warmer)
+	}
 	runtime.mu.Lock()
-	runtime.plugin = newPlugin(cfg)
+	old := runtime.plugin
+	runtime.plugin = next
 	runtime.mu.Unlock()
+	old.Close()
+	next.Start()
 	return nil
 }
 
@@ -264,12 +316,22 @@ func newPlugin(cfg pluginConfig) *turnstate.Plugin {
 }
 
 func resetRuntime() {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	resetRuntimeLocked()
+}
+
+// Caller holds lifecycleMu through publication, worker join and (for shutdown)
+// callback draining. No reconfigure can publish between these phases.
+func resetRuntimeLocked() {
 	runtime.mu.Lock()
+	old := runtime.plugin
 	runtime.plugin = newPlugin(pluginConfig{
 		MaxEntries:        defaultMaxEntries,
 		MaxPendingEntries: defaultMaxPendingEntries,
 	})
 	runtime.mu.Unlock()
+	old.Close()
 }
 
 func currentPlugin() *turnstate.Plugin {
@@ -302,6 +364,7 @@ func pluginRegistration() registration {
 					Type:        pluginapi.ConfigFieldTypeArray,
 					Description: "Accepted raw byte lengths of turn-state (default: [292, 332]).",
 				},
+				{Name: "prewarm", Type: pluginapi.ConfigFieldTypeObject, Description: "Prewarming: enabled, models, max_probes_per_hour and SOCKS5H proxies; discovers enabled accounts automatically. No Host or business-route changes."},
 			},
 		},
 		Capabilities: registrationCapabilities{
@@ -439,8 +502,29 @@ func hostCallbackID(ctx context.Context) string {
 	return callbackID
 }
 
-func callHostLog(payload []byte) {
-	cMethod := C.CString(pluginabi.MethodHostLog)
+// A C-shared plugin has a separate Go environment cache. Read libc's live
+// environment so a Host .env loaded after plugin registration is still checked.
+func liveProcessEnv(key string) string {
+	name := C.CString(key)
+	defer C.free(unsafe.Pointer(name))
+	value := C.getenv(name)
+	if value == nil {
+		return ""
+	}
+	return C.GoString(value)
+}
+
+func callHostLog(payload []byte) { _, _ = callHost(pluginabi.MethodHostLog, payload) }
+
+// Host callbacks may run on worker goroutines. Quiesce joins them before the
+// Host API pointer is cleared or the native image is unloaded.
+func callHost(method string, payload []byte) ([]byte, error) {
+	hostCallbackGate.RLock()
+	defer hostCallbackGate.RUnlock()
+	if !hostCallbacksOpen {
+		return nil, fmt.Errorf("Host callbacks are closed")
+	}
+	cMethod := C.CString(method)
 	defer C.free(unsafe.Pointer(cMethod))
 	var request *C.uint8_t
 	if len(payload) > 0 {
@@ -448,7 +532,15 @@ func callHostLog(payload []byte) {
 		defer C.free(unsafe.Pointer(request))
 	}
 	var response C.cliproxy_buffer
-	if C.call_host_api(cMethod, request, C.size_t(len(payload)), &response) == 0 && response.ptr != nil {
-		C.free_host_buffer(response.ptr, response.len)
+	status := C.call_host_api(cMethod, request, C.size_t(len(payload)), &response)
+	if response.ptr != nil {
+		defer C.free_host_buffer(response.ptr, response.len)
 	}
+	if status != 0 || response.ptr == nil {
+		return nil, fmt.Errorf("Host callback failed")
+	}
+	if response.len > 16*1024*1024 {
+		return nil, fmt.Errorf("Host callback response too large")
+	}
+	return C.GoBytes(unsafe.Pointer(response.ptr), C.int(response.len)), nil
 }

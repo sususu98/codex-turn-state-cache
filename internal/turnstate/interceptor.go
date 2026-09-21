@@ -6,14 +6,29 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/5345asda/codex-turn-state-cache/internal/prewarm"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 const selectedAuthIDMetadataKey = "selected_auth_id"
 
 type Plugin struct {
-	cache *Cache
-	log   func(context.Context, string, string)
+	cache  *Cache
+	log    func(context.Context, string, string)
+	warmer *prewarm.Engine
+}
+
+// SetPrewarm is called only before publishing this plugin instance.
+func (p *Plugin) SetPrewarm(e *prewarm.Engine) { p.warmer = e }
+func (p *Plugin) Start() {
+	if p.warmer != nil {
+		p.warmer.Start()
+	}
+}
+func (p *Plugin) Close() {
+	if p.warmer != nil {
+		p.warmer.Close()
+	}
 }
 
 func NewPlugin(cache *Cache, log func(context.Context, string, string)) *Plugin {
@@ -34,6 +49,18 @@ func (p *Plugin) InterceptRequestAfterAuth(ctx context.Context, req pluginapi.Re
 		p.cache.ForgetRequest(req.RequestID)
 		return pluginapi.RequestInterceptResponse{}, nil
 	}
+	if p.warmer != nil && p.warmer.Manages(prewarm.Key{AuthID: key.AuthID, Model: key.Model}) {
+		// This scope uses verified tickets exclusively, never passive captures.
+		p.cache.ForgetRequest(req.RequestID)
+		state, hit := p.warmer.Bind(ctx, req.RequestID, prewarm.Key{AuthID: key.AuthID, Model: key.Model}, len(turnStateValues(req.Headers)) > 0)
+		if !hit {
+			return pluginapi.RequestInterceptResponse{}, nil
+		}
+		if p.log != nil {
+			p.log(ctx, "codex verified turn-state injected", key.Model)
+		}
+		return pluginapi.RequestInterceptResponse{Headers: http.Header{TurnStateHeader: {state}}}, nil
+	}
 	p.cache.BindRequest(req.RequestID, key)
 	state, hit := p.cache.Lookup(key)
 	if !hit {
@@ -49,17 +76,29 @@ func (p *Plugin) InterceptRequestAfterAuth(ctx context.Context, req pluginapi.Re
 
 func (p *Plugin) HandleRequestComplete(_ context.Context, completion pluginapi.RequestCompletion) error {
 	p.cache.ForgetRequest(completion.RequestID)
+	if p.warmer != nil {
+		p.warmer.Complete(completion.RequestID)
+	}
 	return nil
 }
 
 func (p *Plugin) InterceptResponse(ctx context.Context, req pluginapi.ResponseInterceptRequest) (pluginapi.ResponseInterceptResponse, error) {
+	if p.warmer != nil {
+		p.warmer.Headers(req.RequestID, req.ResponseHeaders)
+		p.warmer.JSON(req.RequestID, req.Body)
+	}
 	p.capture(ctx, req.RequestID, req.ResponseHeaders, "http")
 	return pluginapi.ResponseInterceptResponse{}, nil
 }
 
 func (p *Plugin) InterceptStreamChunk(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
 	if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+		if p.warmer != nil {
+			p.warmer.Headers(req.RequestID, req.ResponseHeaders)
+		}
 		p.capture(ctx, req.RequestID, req.ResponseHeaders, "stream")
+	} else if p.warmer != nil {
+		p.warmer.Chunk(req.RequestID, req.Body)
 	}
 	return pluginapi.StreamChunkInterceptResponse{}, nil
 }
@@ -67,6 +106,11 @@ func (p *Plugin) InterceptStreamChunk(ctx context.Context, req pluginapi.StreamC
 func (p *Plugin) ObserveWebSocketResponseEvent(ctx context.Context, event pluginapi.WebSocketResponseEvent) error {
 	if event.RequestID == "" || len(event.Payload) == 0 {
 		return nil
+	}
+	if p.warmer != nil {
+		state, _ := parseWebSocketTurnState(event.Payload)
+		p.warmer.Headers(event.RequestID, http.Header{TurnStateHeader: {state}})
+		p.warmer.JSON(event.RequestID, event.Payload)
 	}
 	p.captureWebSocket(ctx, event.RequestID, event.Payload)
 	return nil

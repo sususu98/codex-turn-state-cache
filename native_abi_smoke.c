@@ -129,12 +129,13 @@ static void make_state(char state[293], char value) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <plugin.so>\n", argv[0]);
+    int check_auto_config = argc == 4 && strcmp(argv[1], "-config") == 0;
+    if (argc != 2 && !check_auto_config) {
+        fprintf(stderr, "usage: %s [-config <dummy-config.yaml>] <plugin.so>\n", argv[0]);
         return 2;
     }
 
-    void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    void *handle = dlopen(argv[check_auto_config ? 3 : 1], RTLD_NOW | RTLD_LOCAL);
     if (handle == NULL) {
         fprintf(stderr, "unable to load plugin\n");
         return 1;
@@ -196,6 +197,14 @@ int main(int argc, char **argv) {
     ok = ok && invoke(&api, "late response", "response.intercept_after", request, "\"ok\":true", NULL);
     ok = ok && invoke(&api, "late miss", "request.intercept_after", "{\"RequestID\":\"late-hit\",\"ToFormat\":\"codex\",\"Model\":\"model-late\",\"Metadata\":{\"selected_auth_id\":\"auth-a\"}}", "\"ok\":true", state_a);
 
+    if (check_auto_config) {
+        /* Minimal inline-proxy config with no Host path/account list. The fake
+         * Host provides no auth directory; shutdown cancels before acquisition.
+         * This exercises actual C-shared argv/path inference, without networking. */
+        ok = ok && invoke(&api, "minimal native config", "plugin.reconfigure",
+            "{\"schema_version\":6,\"config_yaml\":\"cHJld2FybToKICBlbmFibGVkOiB0cnVlCiAgbW9kZWxzOiBbZ3B0LXRlc3RdCiAgbWF4X3Byb2Jlc19wZXJfaG91cjogMTIKICBwcm94aWVzOiBbInNvY2tzNWg6Ly91c2VyOnBhc3NAMTI3LjAuMC4xOjEwODAiXQo=\"}",
+            "\"ok\":true", NULL);
+    }
     api.shutdown();
     dlclose(handle);
     if (!ok) {

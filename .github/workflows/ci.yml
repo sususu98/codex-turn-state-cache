@@ -34,6 +34,14 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
+      - name: Native ABI smoke test
+        run: |
+          go build -trimpath -buildmode=c-shared -o "$RUNNER_TEMP/turn-state.so" ./cmd/plugin
+          cc -Wall -Wextra -Werror native_abi_smoke.c -ldl -o "$RUNNER_TEMP/abi-smoke"
+          "$RUNNER_TEMP/abi-smoke" "$RUNNER_TEMP/turn-state.so"
+          printf 'proxy-url: direct\n' > "$RUNNER_TEMP/probe-config.yaml"
+          "$RUNNER_TEMP/abi-smoke" -config "$RUNNER_TEMP/probe-config.yaml" "$RUNNER_TEMP/turn-state.so"
+
   build-linux:
     name: Build Linux (${{ matrix.arch }})
     runs-on: ubuntu-24.04
@@ -72,7 +80,7 @@ jobs:
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             echo "TAG=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            echo "TAG=v0.3.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "TAG=v0.5.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build C-Shared Library (.so)
@@ -134,7 +142,7 @@ jobs:
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             echo "TAG=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            echo "TAG=v0.3.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "TAG=v0.5.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build C-Shared Library (.dylib)
